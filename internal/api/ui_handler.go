@@ -109,6 +109,8 @@ func (h *Handler) ServeUI() http.HandlerFunc {
 		}
 
 		// Serve static files via file server
+		// Update request path to stripped path for fileServer
+		r.URL.Path = path
 		h.logger.Info("serving static file via fileServer", "path", path)
 		fileServer.ServeHTTP(w, r)
 	}
