@@ -228,8 +228,18 @@ func checkClusterHealth(client *nomad.Client) (bool, error) {
 	}
 
 	// Check if agent is alive
-	if health == nil || !health.Client.Ok || !health.Server.Ok {
-		return false, fmt.Errorf("agent health check failed")
+	if health == nil {
+		return false, fmt.Errorf("agent health response is nil")
+	}
+
+	// Check client health if present
+	if health.Client != nil && !health.Client.Ok {
+		return false, fmt.Errorf("client health check failed")
+	}
+
+	// Check server health if present
+	if health.Server != nil && !health.Server.Ok {
+		return false, fmt.Errorf("server health check failed")
 	}
 
 	return true, nil
