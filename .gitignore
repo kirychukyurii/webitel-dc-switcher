@@ -4,8 +4,7 @@ bin/
 *.dll
 *.so
 *.dylib
-dc-switcher
-
+bin
 # Test binary
 *.test
 
