@@ -1,0 +1,36 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+dc-switcher
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# IDE
+.vscode/
+.idea/
+
+# Config files (don't commit actual configs with secrets)
+config.yaml
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# UI
+ui/node_modules/
+ui/dist/
+ui/.gitkeep
+*.log

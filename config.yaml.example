@@ -1,0 +1,53 @@
+server:
+  addr: ":8080"
+  read_timeout: 5s
+  write_timeout: 10s
+  # Optional: base path for reverse proxy (e.g., "/dc-switcher")
+  # If set, UI will be available at http://host/dc-switcher/ and API at http://host/dc-switcher/api/
+  # Leave empty or omit for root path
+  # base_path: "/dc-switcher"
+
+cache:
+  ttl: 30s
+
+# Health check for active region monitoring
+# Periodically checks if the active region's Nomad Server has a leader
+# If leader is lost for failed_threshold consecutive checks, drains all nodes in the region
+health_check:
+  enabled: true
+  interval: 30s           # How often to check active region health
+  failed_threshold: 3     # Number of consecutive failures before draining region
+
+# Cluster initialization behavior
+# If true, skip unhealthy clusters during initialization (default: false)
+# If false, fail startup if any cluster is unhealthy
+skip_unhealthy_clusters: false
+
+clusters:
+  # Minimal configuration - name and region auto-detected from Nomad API
+  - address: https://nomad-dc1.example.com:4646
+    tls:
+      ca: /etc/nomad/ca.crt
+      cert: /etc/nomad/client.crt
+      key: /etc/nomad/client.key
+
+  - address: https://nomad-dc2.example.com:4646
+    tls:
+      ca: /etc/nomad/ca.crt
+      cert: /etc/nomad/client.crt
+      key: /etc/nomad/client.key
+
+  # Full configuration - explicitly specify name and region (overrides auto-detection)
+  - name: dc3
+    region: eu-west
+    address: https://nomad-dc3.example.com:4646
+    tls:
+      ca: /etc/nomad/ca.crt
+      cert: /etc/nomad/client.crt
+      key: /etc/nomad/client.key
+
+  # Without TLS
+  - address: https://nomad-dc4.example.com:4646
+    # name: optional - auto-detected from Nomad API (datacenter name)
+    # region: optional - auto-detected from Nomad API
+    # tls: optional - if not specified, will connect without TLS
