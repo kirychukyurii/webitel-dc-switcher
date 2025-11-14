@@ -132,6 +132,28 @@ func (c *Checker) run(ctx context.Context) {
 
 // performCheck executes a single health check cycle
 func (c *Checker) performCheck(ctx context.Context) {
+	// Sync active region with actual state before checking
+	realActiveRegion, err := c.detectActiveRegion(ctx)
+	if err != nil {
+		c.logger.Warn("failed to detect actual active region",
+			slog.String("error", err.Error()),
+		)
+		// Continue with current activeRegion if detection fails
+	} else if realActiveRegion != "" {
+		c.mu.Lock()
+		currentActiveRegion := c.activeRegion
+		if currentActiveRegion != realActiveRegion {
+			c.activeRegion = realActiveRegion
+			// Reset failure counter when active region changes externally
+			c.failureCounter = make(map[string]int)
+			c.logger.Info("active region changed externally, syncing healthcheck",
+				slog.String("old_region", currentActiveRegion),
+				slog.String("new_region", realActiveRegion),
+			)
+		}
+		c.mu.Unlock()
+	}
+
 	// Get currently monitored active region
 	c.mu.RLock()
 	activeRegion := c.activeRegion
