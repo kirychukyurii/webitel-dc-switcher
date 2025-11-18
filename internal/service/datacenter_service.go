@@ -30,6 +30,9 @@ type DatacenterService interface {
 	DrainAllNodesInRegion(ctx context.Context, region string) error
 	EnsureSingleActiveDatacenter(ctx context.Context) error
 	SetHealthChecker(hc HealthChecker)
+	GetJobs(ctx context.Context, dc string) ([]model.Job, error)
+	StartJob(ctx context.Context, dc, jobID string) (*model.JobActionResult, error)
+	StopJob(ctx context.Context, dc, jobID string) (*model.JobActionResult, error)
 }
 
 // datacenterService implements DatacenterService interface
@@ -130,6 +133,25 @@ func (s *datacenterService) getDatacenterInfo(ctx context.Context, name string) 
 	} else {
 		// All nodes are either draining or ineligible
 		dc.Status = model.DatacenterStatusDraining
+	}
+
+	// Get jobs statistics
+	jobs, err := s.repo.ListJobs(ctx, name)
+	if err != nil {
+		// Log error but don't fail - jobs stats are optional
+		s.logger.Warn("failed to get jobs for datacenter",
+			slog.String("datacenter", name),
+			slog.String("error", err.Error()),
+		)
+	} else {
+		dc.JobsTotal = len(jobs)
+		for _, job := range jobs {
+			if job.Status == "running" {
+				dc.JobsRunning++
+			} else if job.Status == "dead" {
+				dc.JobsStopped++
+			}
+		}
 	}
 
 	return dc, nil
@@ -322,6 +344,26 @@ func (s *datacenterService) ActivateDatacenter(ctx context.Context, targetDC str
 		slog.Int("errors_count", len(result.Errors)),
 	)
 
+	// Trigger job evaluations for the activated datacenter to redistribute allocations
+	if result.UnDrainedNodes > 0 {
+		s.logger.Info("triggering job evaluations for activated datacenter",
+			slog.String("datacenter", targetDC),
+		)
+		if err := s.repo.TriggerJobEvaluations(ctx, targetDC); err != nil {
+			// Log error but don't fail the activation
+			errMsg := fmt.Sprintf("failed to trigger job evaluations for %s: %v", targetDC, err)
+			result.Errors = append(result.Errors, errMsg)
+			s.logger.Warn("failed to trigger job evaluations",
+				slog.String("datacenter", targetDC),
+				slog.String("error", err.Error()),
+			)
+		} else {
+			s.logger.Info("job evaluations triggered successfully",
+				slog.String("datacenter", targetDC),
+			)
+		}
+	}
+
 	// Update health checker to monitor the region of the newly activated datacenter
 	if s.healthChecker != nil {
 		s.healthChecker.SetActiveRegion(targetRegion)
@@ -389,6 +431,9 @@ func (s *datacenterService) getRegionInfo(ctx context.Context, regionName string
 	activeCount := 0
 	drainingCount := 0
 	errorCount := 0
+	totalJobs := 0
+	runningJobs := 0
+	stoppedJobs := 0
 
 	for _, result := range results {
 		dc := result.Value
@@ -403,6 +448,11 @@ func (s *datacenterService) getRegionInfo(ctx context.Context, regionName string
 		case model.DatacenterStatusError:
 			errorCount++
 		}
+
+		// Aggregate jobs statistics
+		totalJobs += dc.JobsTotal
+		runningJobs += dc.JobsRunning
+		stoppedJobs += dc.JobsStopped
 	}
 
 	// Determine region status
@@ -419,6 +469,9 @@ func (s *datacenterService) getRegionInfo(ctx context.Context, regionName string
 		Name:        regionName,
 		Datacenters: datacenters,
 		Status:      regionStatus,
+		JobsTotal:   totalJobs,
+		JobsRunning: runningJobs,
+		JobsStopped: stoppedJobs,
 	}, nil
 }
 
@@ -598,6 +651,35 @@ func (s *datacenterService) ActivateRegion(ctx context.Context, targetRegion str
 		slog.Int("un_drained_nodes", result.UnDrainedNodes),
 		slog.Int("errors_count", len(result.Errors)),
 	)
+
+	// Trigger job evaluations for all datacenters in the activated region
+	if result.UnDrainedNodes > 0 {
+		s.logger.Info("triggering job evaluations for activated region",
+			slog.String("region", targetRegion),
+			slog.Int("datacenters", len(targetClusters)),
+		)
+
+		// Trigger evaluations for all clusters in the region in parallel
+		evalErrors := []string{}
+		for _, clusterName := range targetClusters {
+			if err := s.repo.TriggerJobEvaluations(ctx, clusterName); err != nil {
+				errMsg := fmt.Sprintf("datacenter %s: %v", clusterName, err)
+				evalErrors = append(evalErrors, errMsg)
+				s.logger.Warn("failed to trigger job evaluations",
+					slog.String("datacenter", clusterName),
+					slog.String("error", err.Error()),
+				)
+			} else {
+				s.logger.Info("job evaluations triggered successfully",
+					slog.String("datacenter", clusterName),
+				)
+			}
+		}
+
+		if len(evalErrors) > 0 {
+			result.Errors = append(result.Errors, evalErrors...)
+		}
+	}
 
 	// Update health checker to monitor the newly activated region
 	if s.healthChecker != nil {
@@ -880,4 +962,83 @@ func (s *datacenterService) DrainAllNodesInRegion(ctx context.Context, region st
 	}
 
 	return nil
+}
+
+// GetJobs returns all jobs for a specific datacenter
+func (s *datacenterService) GetJobs(ctx context.Context, dc string) ([]model.Job, error) {
+	jobs, err := s.repo.ListJobs(ctx, dc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list jobs: %w", err)
+	}
+	return jobs, nil
+}
+
+// StartJob starts a stopped job in the specified datacenter
+func (s *datacenterService) StartJob(ctx context.Context, dc, jobID string) (*model.JobActionResult, error) {
+	s.logger.Info("starting job",
+		slog.String("datacenter", dc),
+		slog.String("job_id", jobID),
+	)
+
+	result := &model.JobActionResult{
+		JobID:   jobID,
+		Action:  "start",
+		Success: false,
+		Errors:  []string{},
+	}
+
+	err := s.repo.StartJob(ctx, dc, jobID)
+	if err != nil {
+		errMsg := fmt.Sprintf("failed to start job %s: %v", jobID, err)
+		result.Errors = append(result.Errors, errMsg)
+		s.logger.Error("failed to start job",
+			slog.String("datacenter", dc),
+			slog.String("job_id", jobID),
+			slog.String("error", err.Error()),
+		)
+		return result, err
+	}
+
+	result.Success = true
+	s.logger.Info("job started successfully",
+		slog.String("datacenter", dc),
+		slog.String("job_id", jobID),
+	)
+
+	return result, nil
+}
+
+// StopJob stops a running job in the specified datacenter
+func (s *datacenterService) StopJob(ctx context.Context, dc, jobID string) (*model.JobActionResult, error) {
+	s.logger.Info("stopping job",
+		slog.String("datacenter", dc),
+		slog.String("job_id", jobID),
+	)
+
+	result := &model.JobActionResult{
+		JobID:   jobID,
+		Action:  "stop",
+		Success: false,
+		Errors:  []string{},
+	}
+
+	err := s.repo.StopJob(ctx, dc, jobID)
+	if err != nil {
+		errMsg := fmt.Sprintf("failed to stop job %s: %v", jobID, err)
+		result.Errors = append(result.Errors, errMsg)
+		s.logger.Error("failed to stop job",
+			slog.String("datacenter", dc),
+			slog.String("job_id", jobID),
+			slog.String("error", err.Error()),
+		)
+		return result, err
+	}
+
+	result.Success = true
+	s.logger.Info("job stopped successfully",
+		slog.String("datacenter", dc),
+		slog.String("job_id", jobID),
+	)
+
+	return result, nil
 }

@@ -33,6 +33,22 @@
           />
         </div>
 
+        <!-- Region Jobs Summary -->
+        <div v-if="region.jobs_total > 0" class="region-card__summary">
+          <div class="summary-item">
+            <span class="summary-item__label">Jobs:</span>
+            <span class="summary-item__value">{{ region.jobs_total }}</span>
+          </div>
+          <div class="summary-item summary-item--success">
+            <span class="summary-item__label">Running:</span>
+            <span class="summary-item__value">{{ region.jobs_running }}</span>
+          </div>
+          <div class="summary-item summary-item--secondary">
+            <span class="summary-item__label">Stopped:</span>
+            <span class="summary-item__value">{{ region.jobs_stopped }}</span>
+          </div>
+        </div>
+
         <div class="region-card__datacenters">
           <h4 class="region-card__subtitle">Datacenters</h4>
           <div class="datacenters-list">
@@ -64,18 +80,34 @@
                 class="datacenter-item__stats"
                 @click="goToDatacenter(dc.name)"
               >
-                <span class="stat">
-                  <span class="stat__label">Total:</span>
-                  <span class="stat__value">{{ dc.nodes_total }}</span>
-                </span>
-                <span class="stat stat--success">
-                  <span class="stat__label">Ready:</span>
-                  <span class="stat__value">{{ dc.nodes_ready }}</span>
-                </span>
-                <span class="stat stat--warning">
-                  <span class="stat__label">Draining:</span>
-                  <span class="stat__value">{{ dc.nodes_draining }}</span>
-                </span>
+                <div class="stats-group">
+                  <span class="stat">
+                    <span class="stat__label">Nodes:</span>
+                    <span class="stat__value">{{ dc.nodes_total }}</span>
+                  </span>
+                  <span class="stat stat--success">
+                    <span class="stat__label">Ready:</span>
+                    <span class="stat__value">{{ dc.nodes_ready }}</span>
+                  </span>
+                  <span class="stat stat--warning">
+                    <span class="stat__label">Draining:</span>
+                    <span class="stat__value">{{ dc.nodes_draining }}</span>
+                  </span>
+                </div>
+                <div v-if="dc.jobs_total > 0" class="stats-group">
+                  <span class="stat">
+                    <span class="stat__label">Jobs:</span>
+                    <span class="stat__value">{{ dc.jobs_total }}</span>
+                  </span>
+                  <span class="stat stat--success">
+                    <span class="stat__label">Running:</span>
+                    <span class="stat__value">{{ dc.jobs_running }}</span>
+                  </span>
+                  <span class="stat stat--secondary">
+                    <span class="stat__label">Stopped:</span>
+                    <span class="stat__value">{{ dc.jobs_stopped }}</span>
+                  </span>
+                </div>
               </div>
             </div>
           </div>
@@ -285,6 +317,10 @@ export default {
           error.value = null
           try {
             await datacentersAPI.activateDatacenter(region.datacenters[0].name)
+
+            // Wait for jobs to start after evaluation
+            await new Promise(resolve => setTimeout(resolve, 1500))
+
             await loadRegions()
             closeConfirmPopup()
 
@@ -322,6 +358,9 @@ export default {
             await new Promise(resolve => setTimeout(resolve, 500))
           }
         }
+
+        // Wait for jobs to start after evaluation
+        await new Promise(resolve => setTimeout(resolve, 1500))
 
         await loadRegions()
         closeConfirmPopup()
@@ -443,6 +482,42 @@ export default {
   color: var(--wt-color-main, #1a202c);
 }
 
+.region-card__summary {
+  display: flex;
+  gap: var(--spacing-lg, 20px);
+  padding: var(--spacing-sm, 12px);
+  margin-bottom: var(--spacing-md, 16px);
+  background-color: var(--wt-color-background, #f7fafc);
+  border-radius: var(--border-radius, 4px);
+  border: 1px solid var(--wt-color-border, #e2e8f0);
+}
+
+.summary-item {
+  display: flex;
+  gap: var(--spacing-xs, 6px);
+  align-items: center;
+}
+
+.summary-item__label {
+  font-size: 13px;
+  color: var(--wt-color-secondary, #718096);
+  font-weight: 500;
+}
+
+.summary-item__value {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--wt-color-main, #2d3748);
+}
+
+.summary-item--success .summary-item__value {
+  color: var(--wt-color-success, #38a169);
+}
+
+.summary-item--secondary .summary-item__value {
+  color: var(--wt-color-secondary, #718096);
+}
+
 .region-card__datacenters {
   margin-bottom: var(--spacing-md, 16px);
 }
@@ -503,7 +578,8 @@ export default {
 
 .datacenter-item__stats {
   display: flex;
-  gap: var(--spacing-md, 16px);
+  flex-direction: column;
+  gap: var(--spacing-sm, 8px);
   font-size: 13px;
   cursor: pointer;
   padding: 4px;
@@ -513,6 +589,21 @@ export default {
 
 .datacenter-item__stats:hover {
   background-color: rgba(0, 0, 0, 0.02);
+}
+
+.stats-group {
+  display: flex;
+  gap: var(--spacing-sm, 12px);
+  align-items: center;
+}
+
+.stats-group__title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--wt-color-secondary, #4a5568);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  min-width: 48px;
 }
 
 .stat {
@@ -535,6 +626,10 @@ export default {
 
 .stat--warning .stat__value {
   color: var(--wt-color-warning, #dd6b20);
+}
+
+.stat--secondary .stat__value {
+  color: var(--wt-color-secondary, #718096);
 }
 
 .region-card__actions {

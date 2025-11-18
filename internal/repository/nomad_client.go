@@ -27,6 +27,10 @@ type NomadRepository interface {
 	GetClusterRegion(clusterName string) (string, error)
 	GetClustersByRegion(region string) []string
 	GetAllRegions() []string
+	TriggerJobEvaluations(ctx context.Context, clusterName string) error
+	ListJobs(ctx context.Context, clusterName string) ([]model.Job, error)
+	StartJob(ctx context.Context, clusterName, jobID string) error
+	StopJob(ctx context.Context, clusterName, jobID string) error
 }
 
 // nodeCache stores cached information about a node for direct API access
@@ -546,4 +550,215 @@ func (r *nomadRepository) GetAllRegions() []string {
 	}
 	sort.Strings(regions)
 	return regions
+}
+
+// TriggerJobEvaluations triggers evaluations for all jobs in the cluster
+// This forces Nomad scheduler to re-evaluate job placements, which is useful
+// after un-draining nodes to redistribute allocations
+func (r *nomadRepository) TriggerJobEvaluations(ctx context.Context, clusterName string) error {
+	clusterMeta, ok := r.clusters[clusterName]
+	if !ok {
+		return fmt.Errorf("cluster %s not found", clusterName)
+	}
+
+	r.logger.Info("triggering job evaluations",
+		slog.String("cluster", clusterName),
+		slog.String("region", clusterMeta.region),
+	)
+
+	// List all jobs in the cluster
+	jobs, _, err := clusterMeta.client.Jobs().List(nil)
+	if err != nil {
+		return fmt.Errorf("failed to list jobs: %w", err)
+	}
+
+	r.logger.Info("found jobs to evaluate",
+		slog.String("cluster", clusterName),
+		slog.Int("job_count", len(jobs)),
+	)
+
+	// Track evaluation results
+	successCount := 0
+	errorCount := 0
+	var errors []string
+
+	// Trigger evaluation for each job
+	for _, job := range jobs {
+		// Skip jobs that are stopped/dead
+		if job.Status == "dead" {
+			r.logger.Debug("skipping dead job",
+				slog.String("cluster", clusterName),
+				slog.String("job_id", job.ID),
+				slog.String("status", job.Status),
+			)
+			continue
+		}
+
+		// Force evaluation for this job
+		evalID, _, err := clusterMeta.client.Jobs().ForceEvaluate(job.ID, nil)
+		if err != nil {
+			errorCount++
+			errMsg := fmt.Sprintf("job %s: %v", job.ID, err)
+			errors = append(errors, errMsg)
+			r.logger.Warn("failed to trigger evaluation for job",
+				slog.String("cluster", clusterName),
+				slog.String("job_id", job.ID),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+
+		successCount++
+		r.logger.Debug("triggered evaluation for job",
+			slog.String("cluster", clusterName),
+			slog.String("job_id", job.ID),
+			slog.String("eval_id", evalID),
+		)
+	}
+
+	r.logger.Info("job evaluations triggered",
+		slog.String("cluster", clusterName),
+		slog.Int("total_jobs", len(jobs)),
+		slog.Int("success", successCount),
+		slog.Int("errors", errorCount),
+	)
+
+	// Return error if all evaluations failed
+	if errorCount > 0 && successCount == 0 {
+		return fmt.Errorf("all job evaluations failed: %v", errors)
+	}
+
+	// Log warnings if some failed but continue
+	if errorCount > 0 {
+		r.logger.Warn("some job evaluations failed",
+			slog.String("cluster", clusterName),
+			slog.Int("error_count", errorCount),
+			slog.Any("errors", errors),
+		)
+	}
+
+	return nil
+}
+
+// ListJobs returns all jobs in the specified cluster
+func (r *nomadRepository) ListJobs(ctx context.Context, clusterName string) ([]model.Job, error) {
+	clusterMeta, ok := r.clusters[clusterName]
+	if !ok {
+		return nil, fmt.Errorf("cluster %s not found", clusterName)
+	}
+
+	// List all jobs
+	jobs, _, err := clusterMeta.client.Jobs().List(nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list jobs: %w", err)
+	}
+
+	result := make([]model.Job, 0, len(jobs))
+	for _, j := range jobs {
+		// Get job summary for allocation counts
+		summary, _, err := clusterMeta.client.Jobs().Summary(j.ID, nil)
+		if err != nil {
+			r.logger.Warn("failed to get job summary, using basic info",
+				slog.String("cluster", clusterName),
+				slog.String("job_id", j.ID),
+				slog.String("error", err.Error()),
+			)
+			// Continue with basic info if summary fails
+			result = append(result, model.Job{
+				ID:          j.ID,
+				Name:        j.Name,
+				Type:        j.Type,
+				Status:      j.Status,
+				Priority:    j.Priority,
+				SubmitTime:  j.SubmitTime,
+				Datacenters: j.Datacenters,
+			})
+			continue
+		}
+
+		// Calculate total allocations across all task groups
+		var running, desired, failed int
+		if summary != nil && summary.Summary != nil {
+			for _, tg := range summary.Summary {
+				running += tg.Running
+				desired += tg.Queued + tg.Starting + tg.Running
+				failed += tg.Failed + tg.Lost
+			}
+		}
+
+		result = append(result, model.Job{
+			ID:          j.ID,
+			Name:        j.Name,
+			Type:        j.Type,
+			Status:      j.Status,
+			Running:     running,
+			Desired:     desired,
+			Failed:      failed,
+			Priority:    j.Priority,
+			SubmitTime:  j.SubmitTime,
+			Datacenters: j.Datacenters,
+		})
+	}
+
+	r.logger.Info("listed jobs",
+		slog.String("cluster", clusterName),
+		slog.String("region", clusterMeta.region),
+		slog.Int("count", len(result)),
+	)
+
+	return result, nil
+}
+
+// StartJob starts (registers) a stopped job
+func (r *nomadRepository) StartJob(ctx context.Context, clusterName, jobID string) error {
+	clusterMeta, ok := r.clusters[clusterName]
+	if !ok {
+		return fmt.Errorf("cluster %s not found", clusterName)
+	}
+
+	// Get the job definition first
+	job, _, err := clusterMeta.client.Jobs().Info(jobID, nil)
+	if err != nil {
+		return fmt.Errorf("failed to get job info: %w", err)
+	}
+
+	// Set Stop to false to start the job
+	stop := false
+	job.Stop = &stop
+
+	// Register the job (this will start it)
+	_, _, err = clusterMeta.client.Jobs().Register(job, nil)
+	if err != nil {
+		return fmt.Errorf("failed to start job: %w", err)
+	}
+
+	r.logger.Info("started job",
+		slog.String("cluster", clusterName),
+		slog.String("region", clusterMeta.region),
+		slog.String("job_id", jobID),
+	)
+
+	return nil
+}
+
+// StopJob stops (deregisters) a running job
+func (r *nomadRepository) StopJob(ctx context.Context, clusterName, jobID string) error {
+	clusterMeta, ok := r.clusters[clusterName]
+	if !ok {
+		return fmt.Errorf("cluster %s not found", clusterName)
+	}
+
+	// Deregister the job (purge=false keeps it in the system)
+	_, _, err := clusterMeta.client.Jobs().Deregister(jobID, false, nil)
+	if err != nil {
+		return fmt.Errorf("failed to stop job: %w", err)
+	}
+
+	r.logger.Info("stopped job",
+		slog.String("cluster", clusterName),
+		slog.String("region", clusterMeta.region),
+		slog.String("job_id", jobID),
+	)
+
+	return nil
 }

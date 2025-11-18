@@ -61,6 +61,11 @@ func (h *Handler) createRoutes() http.Handler {
 		r.Get("/datacenters/{name}/nodes", h.GetNodes)
 		r.Post("/datacenters/{name}/activate", h.ActivateDatacenter)
 
+		// Job routes
+		r.Get("/datacenters/{name}/jobs", h.GetJobs)
+		r.Post("/datacenters/{name}/jobs/{job_id}/start", h.StartJob)
+		r.Post("/datacenters/{name}/jobs/{job_id}/stop", h.StopJob)
+
 		// Region routes
 		r.Get("/regions", h.ListRegions)
 		r.Get("/regions/{name}/datacenters", h.GetDatacentersByRegion)

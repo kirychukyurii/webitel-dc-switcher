@@ -8,6 +8,9 @@ type Datacenter struct {
 	NodesTotal    int    `json:"nodes_total"`
 	NodesReady    int    `json:"nodes_ready"`
 	NodesDraining int    `json:"nodes_draining"`
+	JobsTotal     int    `json:"jobs_total"`
+	JobsRunning   int    `json:"jobs_running"`
+	JobsStopped   int    `json:"jobs_stopped"`
 }
 
 // DatacenterStatus represents possible datacenter states
@@ -22,4 +25,7 @@ type Region struct {
 	Name        string       `json:"name"`
 	Datacenters []Datacenter `json:"datacenters"`
 	Status      string       `json:"status"` // active | partial | draining | error
+	JobsTotal   int          `json:"jobs_total"`
+	JobsRunning int          `json:"jobs_running"`
+	JobsStopped int          `json:"jobs_stopped"`
 }

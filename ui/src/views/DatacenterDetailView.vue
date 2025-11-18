@@ -15,9 +15,9 @@
         />
       </div>
       <wt-button
-        @click="loadNodes"
-        :disabled="loading"
-        :loading="loading"
+        @click="refreshAll"
+        :disabled="loading || loadingJobs"
+        :loading="loading || loadingJobs"
       >
         Refresh
       </wt-button>
@@ -83,6 +83,71 @@
     <div v-else class="empty-state">
       No nodes found
     </div>
+
+    <!-- Jobs Section -->
+    <div class="jobs-section">
+      <h3 class="section-title">Jobs</h3>
+
+      <div v-if="loadingJobs && jobs.length === 0" class="loading-state">
+        Loading jobs...
+      </div>
+
+      <div v-else-if="jobs.length > 0" class="jobs-list">
+        <wt-table
+          :headers="jobHeaders"
+          :data="jobsTableData"
+          class="jobs-table"
+          sortable
+          resizable-columns
+          @sort="sortJobs"
+        >
+          <template #status="{ item }">
+            <wt-indicator
+              :color="getJobStatusColor(item.status)"
+              :text="item.status"
+              size="md"
+            />
+          </template>
+          <template #type="{ item }">
+            <span class="job-type">{{ item.type }}</span>
+          </template>
+          <template #allocations="{ item }">
+            <span class="job-allocations">
+              {{ item.running }}/{{ item.desired }}
+              <span v-if="item.failed > 0" class="job-failed">({{ item.failed }} failed)</span>
+            </span>
+          </template>
+          <template #actions="{ item }">
+            <div class="job-actions">
+              <wt-button
+                v-if="item.status === 'dead'"
+                size="sm"
+                color="success"
+                @click="startJob(item.id)"
+                :disabled="jobActionLoading[item.id]"
+                :loading="jobActionLoading[item.id]"
+              >
+                Start
+              </wt-button>
+              <wt-button
+                v-else
+                size="sm"
+                color="error"
+                @click="stopJob(item.id)"
+                :disabled="jobActionLoading[item.id]"
+                :loading="jobActionLoading[item.id]"
+              >
+                Stop
+              </wt-button>
+            </div>
+          </template>
+        </wt-table>
+      </div>
+
+      <div v-else class="empty-state">
+        No jobs found
+      </div>
+    </div>
   </div>
 </template>
 
@@ -104,6 +169,10 @@ export default {
     const loading = ref(false)
     const error = ref(null)
 
+    const jobs = ref([])
+    const loadingJobs = ref(false)
+    const jobActionLoading = ref({})
+
     const nodeHeaders = ref([
       { text: 'Name', value: 'name', sort: null },
       { text: 'ID', value: 'id', sort: null },
@@ -112,8 +181,21 @@ export default {
       { text: 'Eligibility', value: 'scheduling_eligibility', sort: null },
     ])
 
+    const jobHeaders = ref([
+      { text: 'ID', value: 'id', sort: null },
+      { text: 'Name', value: 'name', sort: null },
+      { text: 'Type', value: 'type', sort: null },
+      { text: 'Status', value: 'status', sort: null },
+      { text: 'Allocations', value: 'allocations', sort: null },
+      { text: 'Priority', value: 'priority', sort: null },
+    ])
+
     const nodesTableData = computed(() => {
       return nodes.value
+    })
+
+    const jobsTableData = computed(() => {
+      return jobs.value
     })
 
     const getStatusColor = (status) => {
@@ -130,6 +212,15 @@ export default {
         'ready': 'success',
         'down': 'error',
         'initializing': 'info',
+      }
+      return colorMap[status] || 'secondary'
+    }
+
+    const getJobStatusColor = (status) => {
+      const colorMap = {
+        'running': 'success',
+        'pending': 'info',
+        'dead': 'secondary',
       }
       return colorMap[status] || 'secondary'
     }
@@ -160,6 +251,47 @@ export default {
       }
     }
 
+    const loadJobs = async () => {
+      loadingJobs.value = true
+      try {
+        const response = await datacentersAPI.getJobs(props.name)
+        jobs.value = response.data
+      } catch (err) {
+        console.error('Failed to load jobs:', err)
+        error.value = err.response?.data?.error || err.message || 'Failed to load jobs'
+      } finally {
+        loadingJobs.value = false
+      }
+    }
+
+    const startJob = async (jobId) => {
+      jobActionLoading.value[jobId] = true
+      try {
+        await datacentersAPI.startJob(props.name, jobId)
+        // Reload jobs after action
+        await loadJobs()
+      } catch (err) {
+        console.error('Failed to start job:', err)
+        error.value = err.response?.data?.error || err.message || 'Failed to start job'
+      } finally {
+        jobActionLoading.value[jobId] = false
+      }
+    }
+
+    const stopJob = async (jobId) => {
+      jobActionLoading.value[jobId] = true
+      try {
+        await datacentersAPI.stopJob(props.name, jobId)
+        // Reload jobs after action
+        await loadJobs()
+      } catch (err) {
+        console.error('Failed to stop job:', err)
+        error.value = err.response?.data?.error || err.message || 'Failed to stop job'
+      } finally {
+        jobActionLoading.value[jobId] = false
+      }
+    }
+
     const sort = (col, sortValue) => {
       // Reset all other columns' sort
       nodeHeaders.value.forEach((header) => {
@@ -172,8 +304,28 @@ export default {
       }
     }
 
+    const sortJobs = (col, sortValue) => {
+      // Reset all other columns' sort
+      jobHeaders.value.forEach((header) => {
+        header.sort = null
+      })
+      // Set the current column's sort
+      const column = jobHeaders.value.find((header) => header.value === col.value)
+      if (column) {
+        column.sort = sortValue
+      }
+    }
+
+    const refreshAll = async () => {
+      await Promise.all([
+        loadNodes(),
+        loadJobs()
+      ])
+    }
+
     onMounted(() => {
       loadNodes()
+      loadJobs()
     })
 
     return {
@@ -187,6 +339,17 @@ export default {
       getStatusColor,
       getNodeStatusColor,
       sort,
+      jobs,
+      loadingJobs,
+      jobActionLoading,
+      jobHeaders,
+      jobsTableData,
+      loadJobs,
+      startJob,
+      stopJob,
+      getJobStatusColor,
+      sortJobs,
+      refreshAll,
     }
   },
 }
@@ -295,5 +458,42 @@ export default {
   border-radius: 8px;
   border: 1px solid #e2e8f0;
   overflow: hidden;
+}
+
+.jobs-section {
+  margin-top: 48px;
+  padding-top: 24px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.jobs-table {
+  background-color: #ffffff;
+  border-radius: 8px;
+  border: 1px solid #e2e8f0;
+  overflow: hidden;
+}
+
+.job-type {
+  text-transform: capitalize;
+  padding: 4px 8px;
+  background-color: #edf2f7;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.job-allocations {
+  font-family: monospace;
+  font-size: 13px;
+}
+
+.job-failed {
+  color: #c53030;
+  margin-left: 4px;
+}
+
+.job-actions {
+  display: flex;
+  gap: 8px;
 }
 </style>

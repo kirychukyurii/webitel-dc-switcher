@@ -43,6 +43,21 @@ export const datacentersAPI = {
   activateDatacenter(datacenter) {
     return apiClient.post(`/datacenters/${datacenter}/activate`)
   },
+
+  // Get jobs for datacenter
+  getJobs(datacenter) {
+    return apiClient.get(`/datacenters/${datacenter}/jobs`)
+  },
+
+  // Start a job
+  startJob(datacenter, jobId) {
+    return apiClient.post(`/datacenters/${datacenter}/jobs/${jobId}/start`)
+  },
+
+  // Stop a job
+  stopJob(datacenter, jobId) {
+    return apiClient.post(`/datacenters/${datacenter}/jobs/${jobId}/stop`)
+  },
 }
 
 export default apiClient
