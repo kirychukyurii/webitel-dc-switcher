@@ -416,9 +416,13 @@ func (s *datacenterService) ActivateDatacenter(ctx context.Context, targetDC str
 func (s *datacenterService) ListRegions(ctx context.Context) ([]model.Region, error) {
 	regionNames := s.repo.GetAllRegions()
 
-	// Fetch region info in parallel
+	// Fetch region info in parallel with timeout for each region
 	results := concurrent.ParallelMap(ctx, regionNames, func(ctx context.Context, regionName string) (model.Region, error) {
-		region, err := s.getRegionInfo(ctx, regionName)
+		// Add timeout for this specific region (10 seconds - allows time for multiple DCs)
+		regionCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		region, err := s.getRegionInfo(regionCtx, regionName)
 		if err != nil {
 			s.logger.Error("failed to get region info",
 				slog.String("region", regionName),
@@ -447,9 +451,13 @@ func (s *datacenterService) ListRegions(ctx context.Context) ([]model.Region, er
 func (s *datacenterService) getRegionInfo(ctx context.Context, regionName string) (model.Region, error) {
 	clusterNames := s.repo.GetClustersByRegion(regionName)
 
-	// Fetch datacenter info in parallel
+	// Fetch datacenter info in parallel with timeout for each datacenter
 	results := concurrent.ParallelMap(ctx, clusterNames, func(ctx context.Context, name string) (model.Datacenter, error) {
-		dc, err := s.getDatacenterInfo(ctx, name)
+		// Add timeout for this specific datacenter (5 seconds)
+		dcCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		dc, err := s.getDatacenterInfo(dcCtx, name)
 		if err != nil {
 			s.logger.Error("failed to get datacenter info",
 				slog.String("datacenter", name),
@@ -522,9 +530,13 @@ func (s *datacenterService) GetDatacentersByRegion(ctx context.Context, region s
 		return nil, fmt.Errorf("region %s not found or has no datacenters", region)
 	}
 
-	// Fetch datacenter info in parallel
+	// Fetch datacenter info in parallel with timeout for each datacenter
 	results := concurrent.ParallelMap(ctx, clusterNames, func(ctx context.Context, name string) (model.Datacenter, error) {
-		dc, err := s.getDatacenterInfo(ctx, name)
+		// Add timeout for this specific datacenter (5 seconds)
+		dcCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		dc, err := s.getDatacenterInfo(dcCtx, name)
 		if err != nil {
 			s.logger.Error("failed to get datacenter info",
 				slog.String("datacenter", name),
