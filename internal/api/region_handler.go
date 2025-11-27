@@ -11,10 +11,11 @@ import (
 func (h *Handler) ListRegions(w http.ResponseWriter, r *http.Request) {
 	regions, err := h.service.ListRegions(r.Context())
 	if err != nil {
-		h.logger.Error("failed to list regions",
+		h.logger.Warn("failed to list regions",
 			slog.String("error", err.Error()),
 		)
-		h.respondError(w, http.StatusInternalServerError, "failed to list regions")
+		// Return empty list instead of error to allow UI to continue
+		h.respondJSON(w, http.StatusOK, []interface{}{})
 		return
 	}
 
@@ -31,11 +32,12 @@ func (h *Handler) GetDatacentersByRegion(w http.ResponseWriter, r *http.Request)
 
 	datacenters, err := h.service.GetDatacentersByRegion(r.Context(), name)
 	if err != nil {
-		h.logger.Error("failed to get datacenters by region",
+		h.logger.Warn("region not found or unavailable",
 			slog.String("region", name),
 			slog.String("error", err.Error()),
 		)
-		h.respondError(w, http.StatusInternalServerError, err.Error())
+		// Return 404 for not found region
+		h.respondError(w, http.StatusNotFound, err.Error())
 		return
 	}
 

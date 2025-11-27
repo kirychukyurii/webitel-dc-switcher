@@ -31,11 +31,13 @@ func (h *Handler) GetNodes(w http.ResponseWriter, r *http.Request) {
 
 	nodes, err := h.service.GetNodes(r.Context(), name)
 	if err != nil {
-		h.logger.Error("failed to get nodes",
+		h.logger.Warn("datacenter unavailable or unreachable",
 			slog.String("datacenter", name),
 			slog.String("error", err.Error()),
 		)
-		h.respondError(w, http.StatusInternalServerError, "failed to get nodes")
+		// Return empty list with 200 instead of 500
+		// This allows UI to show datacenter as unavailable rather than breaking
+		h.respondJSON(w, http.StatusOK, []interface{}{})
 		return
 	}
 
@@ -80,11 +82,12 @@ func (h *Handler) GetJobs(w http.ResponseWriter, r *http.Request) {
 
 	jobs, err := h.service.GetJobs(r.Context(), name)
 	if err != nil {
-		h.logger.Error("failed to get jobs",
+		h.logger.Warn("datacenter unavailable or unreachable",
 			slog.String("datacenter", name),
 			slog.String("error", err.Error()),
 		)
-		h.respondError(w, http.StatusInternalServerError, "failed to get jobs")
+		// Return empty list with 200 instead of 500
+		h.respondJSON(w, http.StatusOK, []interface{}{})
 		return
 	}
 
