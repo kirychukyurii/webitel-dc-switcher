@@ -1174,30 +1174,47 @@ func (s *datacenterService) PerformStartupReconciliation(ctx context.Context) er
 	}
 
 	// Fresh heartbeat exists but I'm starting up
-	// This means another instance might be running!
+	// This could mean another instance is running, or we restarted quickly
 	age := activeInfo.HeartbeatAge()
 	if age < s.heartbeatCfg.StaleThreshold {
 		s.logger.Warn("fresh heartbeat exists but I'm starting up - checking node states",
 			"heartbeat_age", age)
 
-		// Check if nodes are actually drained
-		allDrained, drainErr := s.drainMyNodes(ctx)
-		if drainErr != nil {
-			return fmt.Errorf("failed to drain nodes: %w", drainErr)
+		// Check if nodes are drained (without modifying them)
+		allDrained, checkErr := s.checkNodesAreDrained(ctx)
+		if checkErr != nil {
+			return fmt.Errorf("failed to check node states: %w", checkErr)
 		}
-		s.amDrained = allDrained
 
 		if !allDrained {
-			// Nodes are active - another instance might be running or nodes were left active
-			s.logger.Error("fresh heartbeat and active nodes found - another instance might be running!",
-				"heartbeat_age", age,
-				"action", "nodes drained for safety")
-			return fmt.Errorf("another instance of this datacenter might be running (fresh heartbeat + active nodes)")
+			// Nodes are active with fresh heartbeat
+			// If heartbeat is VERY fresh (< update_interval/2), another instance might be running
+			// Otherwise, this is likely our old heartbeat from before restart
+			if age < s.heartbeatCfg.UpdateInterval/2 {
+				s.logger.Error("very fresh heartbeat with active nodes - another instance might be running!",
+					"heartbeat_age", age,
+					"update_interval", s.heartbeatCfg.UpdateInterval,
+					"action", "draining nodes for safety")
+				// Drain nodes for safety
+				drained, drainErr := s.drainMyNodes(ctx)
+				if drainErr != nil {
+					return fmt.Errorf("failed to drain nodes: %w", drainErr)
+				}
+				s.amDrained = drained
+				return fmt.Errorf("another instance might be running (very fresh heartbeat + active nodes)")
+			}
+
+			// Heartbeat is not super fresh - likely our old heartbeat from before restart
+			s.logger.Info("found our old heartbeat with active nodes, resuming as active",
+				"heartbeat_age", age)
+			s.amDrained = false
+			return nil
 		}
 
-		// Nodes were already drained - safe to continue but stay drained
+		// Nodes are already drained - safe to continue but stay drained
 		s.logger.Info("fresh heartbeat but nodes already drained, staying drained for safety",
 			"heartbeat_age", age)
+		s.amDrained = true
 		return nil
 	}
 
@@ -1205,6 +1222,25 @@ func (s *datacenterService) PerformStartupReconciliation(ctx context.Context) er
 	s.logger.Info("resuming as active datacenter")
 	s.amDrained = false
 	return nil
+}
+
+// checkNodesAreDrained checks if all nodes in my datacenter are drained without modifying them
+// Returns true if all nodes are drained, false if any are active
+func (s *datacenterService) checkNodesAreDrained(ctx context.Context) (bool, error) {
+	nodes, err := s.GetNodes(ctx, s.myDatacenter)
+	if err != nil {
+		return false, fmt.Errorf("failed to get nodes: %w", err)
+	}
+
+	for _, node := range nodes {
+		if !node.Drain && node.SchedulingEligibility == "eligible" {
+			// Found at least one active node
+			return false, nil
+		}
+	}
+
+	// All nodes are drained
+	return true, nil
 }
 
 // drainMyNodes drains all nodes in my datacenter
