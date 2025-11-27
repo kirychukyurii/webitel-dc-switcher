@@ -8,6 +8,7 @@ import (
 
 	"github.com/kirychukyurii/webitel-dc-switcher/internal/cache"
 	"github.com/kirychukyurii/webitel-dc-switcher/internal/concurrent"
+	"github.com/kirychukyurii/webitel-dc-switcher/internal/config"
 	"github.com/kirychukyurii/webitel-dc-switcher/internal/model"
 	"github.com/kirychukyurii/webitel-dc-switcher/internal/repository"
 )
@@ -29,6 +30,9 @@ type DatacenterService interface {
 	ActivateRegion(ctx context.Context, region string) (*model.ActivationResult, error)
 	DrainAllNodesInRegion(ctx context.Context, region string) error
 	EnsureSingleActiveDatacenter(ctx context.Context) error
+	PerformStartupReconciliation(ctx context.Context) error
+	StartHeartbeat(ctx context.Context)
+	StopHeartbeat()
 	SetHealthChecker(hc HealthChecker)
 	GetJobs(ctx context.Context, dc string) ([]model.Job, error)
 	StartJob(ctx context.Context, dc, jobID string) (*model.JobActionResult, error)
@@ -38,10 +42,15 @@ type DatacenterService interface {
 // datacenterService implements DatacenterService interface
 type datacenterService struct {
 	repo          repository.NomadRepository
+	etcdRepo      repository.EtcdRepository
 	cache         cache.Cache
 	ttl           time.Duration
 	logger        *slog.Logger
 	healthChecker HealthChecker
+	myDatacenter  string
+	heartbeatCfg  config.HeartbeatConfig
+	amDrained     bool // Tracks if we intentionally drained our nodes
+	stopHeartbeat chan struct{}
 }
 
 // clusterNodesInfo stores nodes information for a cluster
@@ -53,12 +62,24 @@ type clusterNodesInfo struct {
 }
 
 // NewDatacenterService creates a new datacenter service
-func NewDatacenterService(repo repository.NomadRepository, cache cache.Cache, ttl time.Duration, logger *slog.Logger) DatacenterService {
+func NewDatacenterService(
+	repo repository.NomadRepository,
+	etcdRepo repository.EtcdRepository,
+	cache cache.Cache,
+	ttl time.Duration,
+	myDatacenter string,
+	heartbeatCfg config.HeartbeatConfig,
+	logger *slog.Logger,
+) DatacenterService {
 	return &datacenterService{
-		repo:   repo,
-		cache:  cache,
-		ttl:    ttl,
-		logger: logger,
+		repo:          repo,
+		etcdRepo:      etcdRepo,
+		cache:         cache,
+		ttl:           ttl,
+		logger:        logger,
+		myDatacenter:  myDatacenter,
+		heartbeatCfg:  heartbeatCfg,
+		stopHeartbeat: make(chan struct{}),
 	}
 }
 
@@ -362,6 +383,25 @@ func (s *datacenterService) ActivateDatacenter(ctx context.Context, targetDC str
 				slog.String("datacenter", targetDC),
 			)
 		}
+	}
+
+	// Write active datacenter info to etcd
+	activeInfo := &model.ActiveDatacenter{
+		Datacenter:    targetDC,
+		ActivatedAt:   time.Now(),
+		ActivatedBy:   "api",
+		LastHeartbeat: time.Now(),
+	}
+	if err := s.etcdRepo.WriteActiveDatacenter(ctx, activeInfo); err != nil {
+		s.logger.Error("failed to write active datacenter to etcd",
+			"datacenter", targetDC,
+			"error", err.Error())
+		// Add to errors but don't fail activation
+		result.Errors = append(result.Errors, fmt.Sprintf("failed to write to etcd: %v", err))
+	} else {
+		s.logger.Info("wrote active datacenter to etcd", "datacenter", targetDC)
+		// Update local state
+		s.amDrained = false
 	}
 
 	// Update health checker to monitor the region of the newly activated datacenter
@@ -678,6 +718,33 @@ func (s *datacenterService) ActivateRegion(ctx context.Context, targetRegion str
 
 		if len(evalErrors) > 0 {
 			result.Errors = append(result.Errors, evalErrors...)
+		}
+	}
+
+	// Write active datacenter info to etcd (choose first DC in region as active)
+	if len(targetClusters) > 0 {
+		activeDatacenter := targetClusters[0]
+		activeInfo := &model.ActiveDatacenter{
+			Datacenter:    activeDatacenter,
+			ActivatedAt:   time.Now(),
+			ActivatedBy:   "api-region",
+			LastHeartbeat: time.Now(),
+		}
+		if err := s.etcdRepo.WriteActiveDatacenter(ctx, activeInfo); err != nil {
+			s.logger.Error("failed to write active datacenter to etcd",
+				"datacenter", activeDatacenter,
+				"region", targetRegion,
+				"error", err.Error())
+			// Add to errors but don't fail activation
+			result.Errors = append(result.Errors, fmt.Sprintf("failed to write to etcd: %v", err))
+		} else {
+			s.logger.Info("wrote active datacenter to etcd",
+				"datacenter", activeDatacenter,
+				"region", targetRegion)
+			// Update local state if this is my datacenter
+			if activeDatacenter == s.myDatacenter {
+				s.amDrained = false
+			}
 		}
 	}
 
@@ -1041,4 +1108,204 @@ func (s *datacenterService) StopJob(ctx context.Context, dc, jobID string) (*mod
 	)
 
 	return result, nil
+}
+
+// PerformStartupReconciliation reads active datacenter from etcd and reconciles local state
+func (s *datacenterService) PerformStartupReconciliation(ctx context.Context) error {
+	s.logger.Info("performing startup reconciliation with etcd")
+
+	// Read active datacenter from etcd
+	activeInfo, err := s.etcdRepo.ReadActiveDatacenter(ctx)
+	if err != nil {
+		s.logger.Warn("no active datacenter found in etcd", "error", err.Error())
+		// No active datacenter in etcd - stay drained for safety
+		s.logger.Info("no active datacenter in etcd, draining my nodes for safety")
+		if err := s.drainMyNodes(ctx); err != nil {
+			return fmt.Errorf("failed to drain nodes: %w", err)
+		}
+		s.amDrained = true
+		return nil
+	}
+
+	s.logger.Info("found active datacenter in etcd",
+		"datacenter", activeInfo.Datacenter,
+		"activated_at", activeInfo.ActivatedAt,
+		"heartbeat_age", activeInfo.HeartbeatAge(),
+	)
+
+	// Check if I should be active
+	if activeInfo.Datacenter != s.myDatacenter {
+		// Another DC is active
+		s.logger.Info("another datacenter is active, ensuring my nodes are drained",
+			"active_dc", activeInfo.Datacenter)
+		if err := s.drainMyNodes(ctx); err != nil {
+			return fmt.Errorf("failed to drain nodes: %w", err)
+		}
+		s.amDrained = true
+		return nil
+	}
+
+	// I should be active - check heartbeat freshness
+	if activeInfo.IsStale(s.heartbeatCfg.StaleThreshold) {
+		age := activeInfo.HeartbeatAge()
+		s.logger.Warn("I am marked as active but heartbeat is stale, staying drained for safety",
+			"heartbeat_age", age,
+			"threshold", s.heartbeatCfg.StaleThreshold)
+		if err := s.drainMyNodes(ctx); err != nil {
+			return fmt.Errorf("failed to drain nodes: %w", err)
+		}
+		s.amDrained = true
+		return nil
+	}
+
+	// Fresh heartbeat exists but I'm starting up
+	// This means another instance might be running!
+	age := activeInfo.HeartbeatAge()
+	if age < s.heartbeatCfg.StaleThreshold {
+		s.logger.Error("fresh heartbeat exists but I'm starting up - another instance might be running!",
+			"heartbeat_age", age,
+			"action", "draining nodes for safety")
+		if err := s.drainMyNodes(ctx); err != nil {
+			return fmt.Errorf("failed to drain nodes: %w", err)
+		}
+		s.amDrained = true
+		return fmt.Errorf("another instance of this datacenter might be running (fresh heartbeat found)")
+	}
+
+	// Heartbeat is old enough - safe to continue as active
+	s.logger.Info("resuming as active datacenter")
+	s.amDrained = false
+	return nil
+}
+
+// drainMyNodes drains all nodes in my datacenter
+func (s *datacenterService) drainMyNodes(ctx context.Context) error {
+	s.logger.Info("draining all nodes in my datacenter", "datacenter", s.myDatacenter)
+
+	nodes, err := s.GetNodes(ctx, s.myDatacenter)
+	if err != nil {
+		return fmt.Errorf("failed to get nodes: %w", err)
+	}
+
+	for _, node := range nodes {
+		if node.Drain || node.SchedulingEligibility != "eligible" {
+			// Already drained or ineligible
+			continue
+		}
+
+		if err := s.repo.SetNodeDrain(ctx, s.myDatacenter, node.ID, true); err != nil {
+			s.logger.Error("failed to drain node",
+				"node_id", node.ID,
+				"node_name", node.Name,
+				"error", err.Error())
+			return fmt.Errorf("failed to drain node %s: %w", node.ID, err)
+		}
+
+		s.logger.Info("drained node",
+			"node_id", node.ID,
+			"node_name", node.Name)
+	}
+
+	// Invalidate cache
+	s.cache.Delete(s.myDatacenter + ":nodes")
+
+	return nil
+}
+
+// StartHeartbeat starts the heartbeat update goroutine
+func (s *datacenterService) StartHeartbeat(ctx context.Context) {
+	go s.heartbeatLoop(ctx)
+}
+
+// StopHeartbeat stops the heartbeat update goroutine
+func (s *datacenterService) StopHeartbeat() {
+	close(s.stopHeartbeat)
+}
+
+// heartbeatLoop periodically updates heartbeat in etcd with fail-safe logic
+func (s *datacenterService) heartbeatLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.heartbeatCfg.UpdateInterval)
+	defer ticker.Stop()
+
+	consecutiveFailures := 0
+
+	s.logger.Info("started heartbeat updater",
+		"interval", s.heartbeatCfg.UpdateInterval,
+		"max_failures", s.heartbeatCfg.MaxFailures)
+
+	for {
+		select {
+		case <-s.stopHeartbeat:
+			s.logger.Info("stopping heartbeat updater")
+			return
+		case <-ticker.C:
+			// Read active datacenter from etcd
+			activeInfo, err := s.etcdRepo.ReadActiveDatacenter(ctx)
+			if err != nil {
+				consecutiveFailures++
+				s.logger.Warn("failed to read active datacenter from etcd",
+					"failures", consecutiveFailures,
+					"error", err.Error())
+				continue
+			}
+
+			// Check if another DC is now active
+			if activeInfo.Datacenter != s.myDatacenter {
+				s.logger.Info("another datacenter is now active, draining my nodes",
+					"active_dc", activeInfo.Datacenter)
+				if !s.amDrained {
+					if err := s.drainMyNodes(ctx); err != nil {
+						s.logger.Error("failed to drain nodes", "error", err.Error())
+					} else {
+						s.amDrained = true
+					}
+				}
+				consecutiveFailures = 0
+				continue
+			}
+
+			// Check for fresh heartbeat from another instance
+			heartbeatAge := activeInfo.HeartbeatAge()
+			if heartbeatAge < s.heartbeatCfg.StaleThreshold && s.amDrained {
+				s.logger.Error("fresh heartbeat exists but I'm drained - another instance running?",
+					"heartbeat_age", heartbeatAge)
+				// Stay drained, don't update heartbeat
+				continue
+			}
+
+			// Try to update heartbeat
+			activeInfo.LastHeartbeat = time.Now()
+			err = s.etcdRepo.WriteActiveDatacenter(ctx, activeInfo)
+			if err != nil {
+				consecutiveFailures++
+				s.logger.Error("failed to update heartbeat in etcd",
+					"failures", consecutiveFailures,
+					"max_failures", s.heartbeatCfg.MaxFailures,
+					"error", err.Error())
+
+				if consecutiveFailures >= s.heartbeatCfg.MaxFailures && !s.amDrained {
+					s.logger.Error("lost etcd quorum - draining nodes to prevent split-brain",
+						"failures", consecutiveFailures)
+					if err := s.drainMyNodes(ctx); err != nil {
+						s.logger.Error("failed to drain nodes during etcd failure", "error", err.Error())
+					} else {
+						s.amDrained = true
+					}
+				}
+			} else {
+				// Success
+				if consecutiveFailures > 0 {
+					s.logger.Info("reconnected to etcd after failures",
+						"failures", consecutiveFailures)
+				}
+				consecutiveFailures = 0
+
+				// Log warning if we're successfully writing but are drained
+				if s.amDrained {
+					s.logger.Warn("successfully writing to etcd but nodes are drained",
+						"action_required", "manual activation via API needed")
+				}
+			}
+		}
+	}
 }

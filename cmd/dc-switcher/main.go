@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/kirychukyurii/webitel-dc-switcher/internal/api"
 	"github.com/kirychukyurii/webitel-dc-switcher/internal/cache"
@@ -54,21 +55,73 @@ func main() {
 		"clusters", len(cfg.Clusters),
 	)
 
-	// Create service
-	svc := service.NewDatacenterService(repo, appCache, cfg.Cache.TTL, log)
+	// Create etcd repository
+	etcdRepo, err := repository.NewEtcdRepository(cfg.Etcd, log)
+	if err != nil {
+		log.Error("failed to create etcd repository",
+			"error", err.Error(),
+		)
+		os.Exit(1)
+	}
+	defer etcdRepo.Close()
 
-	// Ensure only one datacenter is active at startup
-	log.Info("performing startup datacenter state synchronization")
-	if err := svc.EnsureSingleActiveDatacenter(context.Background()); err != nil {
-		log.Error("failed to sync datacenter state at startup",
+	log.Info("etcd client initialized",
+		"endpoints", cfg.Etcd.Endpoints,
+	)
+
+	// Create service
+	svc := service.NewDatacenterService(
+		repo,
+		etcdRepo,
+		appCache,
+		cfg.Cache.TTL,
+		cfg.MyDatacenter,
+		cfg.Heartbeat,
+		log,
+	)
+
+	// Perform startup reconciliation with etcd
+	log.Info("performing startup reconciliation with etcd")
+	if err := svc.PerformStartupReconciliation(context.Background()); err != nil {
+		log.Error("failed to perform startup reconciliation",
 			"error", err.Error(),
 		)
 		// Don't exit - continue with startup but log the error
 	}
 
-	// Create and start health checker
+	// Start heartbeat updater
+	log.Info("starting heartbeat updater")
+	svc.StartHeartbeat(context.Background())
+
+	// Start cluster retry goroutine if skip_unhealthy_clusters is enabled
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	if cfg.SkipUnhealthyClusters {
+		go func() {
+			ticker := time.NewTicker(cfg.ClusterRetryInterval)
+			defer ticker.Stop()
+
+			log.Info("starting cluster retry checker",
+				"interval", cfg.ClusterRetryInterval)
+
+			for {
+				select {
+				case <-ctx.Done():
+					log.Info("stopping cluster retry checker")
+					return
+				case <-ticker.C:
+					added := repo.RetryUnavailableClusters()
+					if added > 0 {
+						log.Info("added previously unavailable clusters",
+							"count", added)
+					}
+				}
+			}
+		}()
+	}
+
+	// Create and start health checker
 
 	healthChecker := healthcheck.NewChecker(&cfg.HealthCheck, svc, log)
 	svc.SetHealthChecker(healthChecker) // Link service with health checker for region change notifications
@@ -117,6 +170,9 @@ func main() {
 	}
 
 	// Graceful shutdown
+	log.Info("shutting down heartbeat updater")
+	svc.StopHeartbeat()
+
 	log.Info("shutting down health checker")
 	cancel() // Cancel context for health checker
 	healthChecker.Stop()

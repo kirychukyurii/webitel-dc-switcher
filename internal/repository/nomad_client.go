@@ -31,6 +31,7 @@ type NomadRepository interface {
 	ListJobs(ctx context.Context, clusterName string) ([]model.Job, error)
 	StartJob(ctx context.Context, clusterName, jobID string) error
 	StopJob(ctx context.Context, clusterName, jobID string) error
+	RetryUnavailableClusters() int
 }
 
 // nodeCache stores cached information about a node for direct API access
@@ -50,13 +51,15 @@ type clusterMetadata struct {
 
 // nomadRepository implements NomadRepository interface
 type nomadRepository struct {
-	clusters map[string]*clusterMetadata
-	logger   *slog.Logger
+	clusters            map[string]*clusterMetadata
+	unavailableClusters []config.ClusterConfig // Clusters that failed health check at startup
+	logger              *slog.Logger
 }
 
 // NewNomadRepository creates a new Nomad repository with clients for each cluster
 func NewNomadRepository(cfg *config.Config, logger *slog.Logger) (NomadRepository, error) {
 	clusters := make(map[string]*clusterMetadata)
+	unavailable := []config.ClusterConfig{}
 	var initErrors []string
 
 	for i, cluster := range cfg.Clusters {
@@ -73,10 +76,12 @@ func NewNomadRepository(cfg *config.Config, logger *slog.Logger) (NomadRepositor
 		healthy, healthErr := checkClusterHealth(client)
 		if !healthy {
 			if cfg.SkipUnhealthyClusters {
-				logger.Warn("skipping unhealthy cluster",
+				logger.Warn("skipping unhealthy cluster, will retry periodically",
 					slog.String("address", cluster.Address),
 					slog.String("error", healthErr.Error()),
 				)
+				// Store for later retry
+				unavailable = append(unavailable, cluster)
 				continue
 			} else {
 				logger.Error("cluster health check failed",
@@ -164,9 +169,16 @@ func NewNomadRepository(cfg *config.Config, logger *slog.Logger) (NomadRepositor
 		)
 	}
 
+	if len(unavailable) > 0 {
+		logger.Info("unavailable clusters will be retried periodically",
+			slog.Int("unavailable_count", len(unavailable)),
+		)
+	}
+
 	return &nomadRepository{
-		clusters: clusters,
-		logger:   logger,
+		clusters:            clusters,
+		unavailableClusters: unavailable,
+		logger:              logger,
 	}, nil
 }
 
@@ -761,4 +773,123 @@ func (r *nomadRepository) StopJob(ctx context.Context, clusterName, jobID string
 	)
 
 	return nil
+}
+
+// RetryUnavailableClusters attempts to connect to previously unavailable clusters
+// Returns number of clusters successfully added
+func (r *nomadRepository) RetryUnavailableClusters() int {
+	if len(r.unavailableClusters) == 0 {
+		return 0
+	}
+
+	r.logger.Info("retrying unavailable clusters",
+		slog.Int("count", len(r.unavailableClusters)),
+	)
+
+	successfullyAdded := 0
+	stillUnavailable := []config.ClusterConfig{}
+
+	for i, cluster := range r.unavailableClusters {
+		r.logger.Info("attempting to connect to cluster",
+			slog.String("address", cluster.Address),
+		)
+
+		client, httpClient, err := createNomadClient(cluster)
+		if err != nil {
+			r.logger.Warn("failed to create client for unavailable cluster",
+				slog.String("address", cluster.Address),
+				slog.String("error", err.Error()),
+			)
+			stillUnavailable = append(stillUnavailable, cluster)
+			continue
+		}
+
+		// Check cluster health
+		healthy, healthErr := checkClusterHealth(client)
+		if !healthy {
+			r.logger.Warn("cluster still unhealthy",
+				slog.String("address", cluster.Address),
+				slog.String("error", healthErr.Error()),
+			)
+			stillUnavailable = append(stillUnavailable, cluster)
+			continue
+		}
+
+		// Auto-detect name and region
+		name := cluster.Name
+		region := cluster.Region
+
+		if name == "" || region == "" {
+			detectedName, detectedRegion, err := detectClusterInfo(client)
+			if err != nil {
+				r.logger.Warn("failed to auto-detect cluster info, using fallback",
+					slog.String("address", cluster.Address),
+					slog.String("error", err.Error()),
+				)
+				if name == "" {
+					name = fmt.Sprintf("cluster-recovered-%d", i)
+				}
+				if region == "" {
+					region = "global"
+				}
+			} else {
+				if name == "" {
+					name = detectedName
+				}
+				if region == "" {
+					region = detectedRegion
+				}
+			}
+		}
+
+		// Check if cluster with this name already exists
+		clusterKey := name
+		if _, exists := r.clusters[name]; exists {
+			clusterKey = fmt.Sprintf("%s-%s", name, region)
+			r.logger.Info("cluster name already exists, using name-region format",
+				slog.String("original_name", name),
+				slog.String("unique_key", clusterKey),
+				slog.String("region", region),
+			)
+		}
+
+		r.logger.Info("successfully connected to previously unavailable cluster",
+			slog.String("name", name),
+			slog.String("key", clusterKey),
+			slog.String("region", region),
+			slog.String("address", cluster.Address),
+		)
+
+		metadata := &clusterMetadata{
+			name:       clusterKey,
+			region:     region,
+			client:     client,
+			httpClient: httpClient,
+			nodeCache:  make(map[string]*nodeCache),
+		}
+
+		// Cache node addresses
+		if err := cacheNodeAddresses(metadata, r.logger); err != nil {
+			r.logger.Warn("failed to cache node addresses",
+				slog.String("cluster", clusterKey),
+				slog.String("error", err.Error()),
+			)
+		}
+
+		// Add to clusters map
+		r.clusters[clusterKey] = metadata
+		successfullyAdded++
+	}
+
+	// Update unavailable clusters list
+	r.unavailableClusters = stillUnavailable
+
+	if successfullyAdded > 0 {
+		r.logger.Info("successfully added previously unavailable clusters",
+			slog.Int("added", successfullyAdded),
+			slog.Int("still_unavailable", len(stillUnavailable)),
+		)
+	}
+
+	return successfullyAdded
 }

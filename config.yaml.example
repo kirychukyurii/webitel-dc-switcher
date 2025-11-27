@@ -10,6 +10,32 @@ server:
 cache:
   ttl: 30s
 
+# Etcd configuration for distributed state and split-brain protection
+etcd:
+  endpoints:
+    - https://etcd1.example.com:2379
+    - https://etcd2.example.com:2379
+    - https://etcd3.example.com:2379
+  dial_timeout: 5s
+  # Optional: authentication
+  # username: "dc-switcher"
+  # password: "secret"
+  # Optional: TLS configuration
+  # tls:
+  #   ca: /etc/etcd/ca.crt
+  #   cert: /etc/etcd/client.crt
+  #   key: /etc/etcd/client.key
+
+# Heartbeat configuration for split-brain protection
+heartbeat:
+  update_interval: 30s    # How often to update heartbeat in etcd
+  max_failures: 3         # Number of consecutive etcd write failures before draining nodes (3 * 30s = 90s)
+  stale_threshold: 2m     # Age after which heartbeat is considered stale
+
+# Local datacenter name - must match one of the cluster names below
+# This identifies which datacenter this instance manages
+my_datacenter: "dc1"
+
 # Health check for active region monitoring
 # Periodically checks if the active region's Nomad Server has a leader
 # If leader is lost for failed_threshold consecutive checks, drains all nodes in the region
@@ -22,6 +48,11 @@ health_check:
 # If true, skip unhealthy clusters during initialization (default: false)
 # If false, fail startup if any cluster is unhealthy
 skip_unhealthy_clusters: false
+
+# Cluster retry interval - how often to retry connecting to unavailable clusters
+# Only applies when skip_unhealthy_clusters is true
+# Default: 5m
+cluster_retry_interval: 5m
 
 clusters:
   # Minimal configuration - name and region auto-detected from Nomad API
