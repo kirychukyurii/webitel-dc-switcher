@@ -204,14 +204,14 @@ func createNomadClient(cluster config.ClusterConfig) (*nomad.Client, *http.Clien
 			Transport: &http.Transport{
 				TLSClientConfig: tlsConfig,
 			},
-			Timeout: 30 * time.Second,
+			Timeout: 5 * time.Second,
 		}
 
 		nomadConfig.HttpClient = httpClient
 	} else {
 		// Create default HTTP client
 		httpClient = &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout: 5 * time.Second,
 		}
 	}
 
