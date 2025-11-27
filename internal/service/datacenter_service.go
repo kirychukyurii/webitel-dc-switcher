@@ -1120,10 +1120,11 @@ func (s *datacenterService) PerformStartupReconciliation(ctx context.Context) er
 		s.logger.Warn("no active datacenter found in etcd", "error", err.Error())
 		// No active datacenter in etcd - stay drained for safety
 		s.logger.Info("no active datacenter in etcd, draining my nodes for safety")
-		if err := s.drainMyNodes(ctx); err != nil {
-			return fmt.Errorf("failed to drain nodes: %w", err)
+		allDrained, drainErr := s.drainMyNodes(ctx)
+		if drainErr != nil {
+			return fmt.Errorf("failed to drain nodes: %w", drainErr)
 		}
-		s.amDrained = true
+		s.amDrained = allDrained
 		return nil
 	}
 
@@ -1138,10 +1139,11 @@ func (s *datacenterService) PerformStartupReconciliation(ctx context.Context) er
 		// Another DC is active
 		s.logger.Info("another datacenter is active, ensuring my nodes are drained",
 			"active_dc", activeInfo.Datacenter)
-		if err := s.drainMyNodes(ctx); err != nil {
-			return fmt.Errorf("failed to drain nodes: %w", err)
+		allDrained, drainErr := s.drainMyNodes(ctx)
+		if drainErr != nil {
+			return fmt.Errorf("failed to drain nodes: %w", drainErr)
 		}
-		s.amDrained = true
+		s.amDrained = allDrained
 		return nil
 	}
 
@@ -1151,10 +1153,11 @@ func (s *datacenterService) PerformStartupReconciliation(ctx context.Context) er
 		s.logger.Warn("I am marked as active but heartbeat is stale, staying drained for safety",
 			"heartbeat_age", age,
 			"threshold", s.heartbeatCfg.StaleThreshold)
-		if err := s.drainMyNodes(ctx); err != nil {
-			return fmt.Errorf("failed to drain nodes: %w", err)
+		allDrained, drainErr := s.drainMyNodes(ctx)
+		if drainErr != nil {
+			return fmt.Errorf("failed to drain nodes: %w", drainErr)
 		}
-		s.amDrained = true
+		s.amDrained = allDrained
 		return nil
 	}
 
@@ -1162,14 +1165,28 @@ func (s *datacenterService) PerformStartupReconciliation(ctx context.Context) er
 	// This means another instance might be running!
 	age := activeInfo.HeartbeatAge()
 	if age < s.heartbeatCfg.StaleThreshold {
-		s.logger.Error("fresh heartbeat exists but I'm starting up - another instance might be running!",
-			"heartbeat_age", age,
-			"action", "draining nodes for safety")
-		if err := s.drainMyNodes(ctx); err != nil {
-			return fmt.Errorf("failed to drain nodes: %w", err)
+		s.logger.Warn("fresh heartbeat exists but I'm starting up - checking node states",
+			"heartbeat_age", age)
+
+		// Check if nodes are actually drained
+		allDrained, drainErr := s.drainMyNodes(ctx)
+		if drainErr != nil {
+			return fmt.Errorf("failed to drain nodes: %w", drainErr)
 		}
-		s.amDrained = true
-		return fmt.Errorf("another instance of this datacenter might be running (fresh heartbeat found)")
+		s.amDrained = allDrained
+
+		if !allDrained {
+			// Nodes are active - another instance might be running or nodes were left active
+			s.logger.Error("fresh heartbeat and active nodes found - another instance might be running!",
+				"heartbeat_age", age,
+				"action", "nodes drained for safety")
+			return fmt.Errorf("another instance of this datacenter might be running (fresh heartbeat + active nodes)")
+		}
+
+		// Nodes were already drained - safe to continue but stay drained
+		s.logger.Info("fresh heartbeat but nodes already drained, staying drained for safety",
+			"heartbeat_age", age)
+		return nil
 	}
 
 	// Heartbeat is old enough - safe to continue as active
@@ -1179,17 +1196,19 @@ func (s *datacenterService) PerformStartupReconciliation(ctx context.Context) er
 }
 
 // drainMyNodes drains all nodes in my datacenter
-func (s *datacenterService) drainMyNodes(ctx context.Context) error {
-	s.logger.Info("draining all nodes in my datacenter", "datacenter", s.myDatacenter)
-
+// Returns true if all nodes are now drained (or were already drained), false otherwise
+func (s *datacenterService) drainMyNodes(ctx context.Context) (bool, error) {
 	nodes, err := s.GetNodes(ctx, s.myDatacenter)
 	if err != nil {
-		return fmt.Errorf("failed to get nodes: %w", err)
+		return false, fmt.Errorf("failed to get nodes: %w", err)
 	}
 
+	drainedCount := 0
+	alreadyDrainedCount := 0
 	for _, node := range nodes {
 		if node.Drain || node.SchedulingEligibility != "eligible" {
 			// Already drained or ineligible
+			alreadyDrainedCount++
 			continue
 		}
 
@@ -1198,18 +1217,27 @@ func (s *datacenterService) drainMyNodes(ctx context.Context) error {
 				"node_id", node.ID,
 				"node_name", node.Name,
 				"error", err.Error())
-			return fmt.Errorf("failed to drain node %s: %w", node.ID, err)
+			return false, fmt.Errorf("failed to drain node %s: %w", node.ID, err)
 		}
 
 		s.logger.Info("drained node",
 			"node_id", node.ID,
 			"node_name", node.Name)
+		drainedCount++
+	}
+
+	if drainedCount > 0 {
+		s.logger.Info("drained nodes in my datacenter",
+			"datacenter", s.myDatacenter,
+			"count", drainedCount)
 	}
 
 	// Invalidate cache
 	s.cache.Delete(s.myDatacenter + ":nodes")
 
-	return nil
+	// Return true if all nodes are drained (either already or just drained)
+	allDrained := (drainedCount + alreadyDrainedCount) == len(nodes)
+	return allDrained, nil
 }
 
 // StartHeartbeat starts the heartbeat update goroutine
@@ -1251,13 +1279,14 @@ func (s *datacenterService) heartbeatLoop(ctx context.Context) {
 
 			// Check if another DC is now active
 			if activeInfo.Datacenter != s.myDatacenter {
-				s.logger.Info("another datacenter is now active, draining my nodes",
-					"active_dc", activeInfo.Datacenter)
 				if !s.amDrained {
-					if err := s.drainMyNodes(ctx); err != nil {
-						s.logger.Error("failed to drain nodes", "error", err.Error())
+					s.logger.Info("another datacenter is now active, draining my nodes",
+						"active_dc", activeInfo.Datacenter)
+					allDrained, drainErr := s.drainMyNodes(ctx)
+					if drainErr != nil {
+						s.logger.Error("failed to drain nodes", "error", drainErr.Error())
 					} else {
-						s.amDrained = true
+						s.amDrained = allDrained
 					}
 				}
 				consecutiveFailures = 0
@@ -1286,10 +1315,11 @@ func (s *datacenterService) heartbeatLoop(ctx context.Context) {
 				if consecutiveFailures >= s.heartbeatCfg.MaxFailures && !s.amDrained {
 					s.logger.Error("lost etcd quorum - draining nodes to prevent split-brain",
 						"failures", consecutiveFailures)
-					if err := s.drainMyNodes(ctx); err != nil {
-						s.logger.Error("failed to drain nodes during etcd failure", "error", err.Error())
+					allDrained, drainErr := s.drainMyNodes(ctx)
+					if drainErr != nil {
+						s.logger.Error("failed to drain nodes during etcd failure", "error", drainErr.Error())
 					} else {
-						s.amDrained = true
+						s.amDrained = allDrained
 					}
 				}
 			} else {
