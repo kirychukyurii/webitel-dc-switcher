@@ -1293,13 +1293,42 @@ func (s *datacenterService) heartbeatLoop(ctx context.Context) {
 				continue
 			}
 
-			// Check for fresh heartbeat from another instance
-			heartbeatAge := activeInfo.HeartbeatAge()
-			if heartbeatAge < s.heartbeatCfg.StaleThreshold && s.amDrained {
-				s.logger.Error("fresh heartbeat exists but I'm drained - another instance running?",
-					"heartbeat_age", heartbeatAge)
-				// Stay drained, don't update heartbeat
-				continue
+			// I should be active - check if I was activated externally
+			if s.amDrained {
+				// Check actual node state - maybe I was activated by another instance via API
+				nodes, err := s.GetNodes(ctx, s.myDatacenter)
+				if err != nil {
+					s.logger.Error("failed to check node states", "error", err.Error())
+					continue
+				}
+
+				// Count active (undrained) nodes
+				activeNodes := 0
+				for _, node := range nodes {
+					if !node.Drain && node.SchedulingEligibility == "eligible" {
+						activeNodes++
+					}
+				}
+
+				if activeNodes > 0 {
+					// Nodes are active - I was activated externally!
+					s.logger.Info("detected external activation - nodes are active, resuming heartbeat",
+						"active_nodes", activeNodes,
+						"total_nodes", len(nodes))
+					s.amDrained = false
+				} else {
+					// Nodes are still drained but fresh heartbeat exists - another instance running?
+					heartbeatAge := activeInfo.HeartbeatAge()
+					if heartbeatAge < s.heartbeatCfg.StaleThreshold {
+						s.logger.Error("fresh heartbeat exists but all nodes drained - another instance running?",
+							"heartbeat_age", heartbeatAge)
+						// Stay drained, don't update heartbeat
+						continue
+					}
+					// Heartbeat is stale enough - safe to resume
+					s.logger.Info("heartbeat is stale, safe to resume as active")
+					s.amDrained = false
+				}
 			}
 
 			// Try to update heartbeat
