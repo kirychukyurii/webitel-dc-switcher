@@ -60,4 +60,11 @@ export const datacentersAPI = {
   },
 }
 
+export const statusAPI = {
+  // Get service status including heartbeat info
+  getStatus() {
+    return apiClient.get('/status')
+  },
+}
+
 export default apiClient

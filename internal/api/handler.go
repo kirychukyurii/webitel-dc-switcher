@@ -70,6 +70,9 @@ func (h *Handler) createRoutes() http.Handler {
 		r.Get("/regions", h.ListRegions)
 		r.Get("/regions/{name}/datacenters", h.GetDatacentersByRegion)
 		r.Post("/regions/{name}/activate", h.ActivateRegion)
+
+		// Status route
+		r.Get("/status", h.GetStatus)
 	})
 
 	// Serve UI (must be last to act as catch-all)

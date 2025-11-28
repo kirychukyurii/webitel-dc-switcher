@@ -11,6 +11,8 @@ type Datacenter struct {
 	JobsTotal     int    `json:"jobs_total"`
 	JobsRunning   int    `json:"jobs_running"`
 	JobsStopped   int    `json:"jobs_stopped"`
+	HeartbeatAge  int64  `json:"heartbeat_age"` // Age of heartbeat in milliseconds (0 if no heartbeat)
+	IsMyDC        bool   `json:"is_my_dc"`      // Whether this is the datacenter managed by this switcher instance
 }
 
 // DatacenterStatus represents possible datacenter states

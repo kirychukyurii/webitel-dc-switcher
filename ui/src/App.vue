@@ -8,6 +8,8 @@
       <div class="header-spacer" />
     </wt-app-header>
 
+    <status-bar />
+
     <main class="app-content">
       <router-view />
     </main>
@@ -18,9 +20,13 @@
 
 <script>
 import { ref } from 'vue'
+import StatusBar from './components/StatusBar.vue'
 
 export default {
   name: 'App',
+  components: {
+    StatusBar,
+  },
   setup() {
     const darkMode = ref(false)
 

@@ -37,6 +37,7 @@ type DatacenterService interface {
 	GetJobs(ctx context.Context, dc string) ([]model.Job, error)
 	StartJob(ctx context.Context, dc, jobID string) (*model.JobActionResult, error)
 	StopJob(ctx context.Context, dc, jobID string) (*model.JobActionResult, error)
+	GetStatus(ctx context.Context) (*model.ServiceStatus, error)
 }
 
 // datacenterService implements DatacenterService interface
@@ -365,8 +366,51 @@ func (s *datacenterService) ActivateDatacenter(ctx context.Context, targetDC str
 		slog.Int("errors_count", len(result.Errors)),
 	)
 
-	// Trigger job evaluations for the activated datacenter to redistribute allocations
+	// Start dead jobs and trigger evaluations for the activated datacenter
 	if result.UnDrainedNodes > 0 {
+		// Start dead jobs BEFORE triggering evaluations so they are included in the eval
+		s.logger.Info("checking for dead jobs to restart",
+			slog.String("datacenter", targetDC),
+		)
+		jobs, err := s.repo.ListJobs(ctx, targetDC)
+		if err != nil {
+			errMsg := fmt.Sprintf("failed to list jobs for %s: %v", targetDC, err)
+			result.Errors = append(result.Errors, errMsg)
+			s.logger.Warn("failed to list jobs",
+				slog.String("datacenter", targetDC),
+				slog.String("error", err.Error()),
+			)
+		} else {
+			startedJobs := 0
+			for _, job := range jobs {
+				if job.Status == "dead" {
+					s.logger.Info("starting dead job",
+						slog.String("datacenter", targetDC),
+						slog.String("job_id", job.ID),
+						slog.String("job_name", job.Name),
+					)
+					if err := s.repo.StartJob(ctx, targetDC, job.ID); err != nil {
+						errMsg := fmt.Sprintf("failed to start job %s: %v", job.ID, err)
+						result.Errors = append(result.Errors, errMsg)
+						s.logger.Warn("failed to start job",
+							slog.String("datacenter", targetDC),
+							slog.String("job_id", job.ID),
+							slog.String("error", err.Error()),
+						)
+					} else {
+						startedJobs++
+					}
+				}
+			}
+			if startedJobs > 0 {
+				s.logger.Info("dead jobs started successfully",
+					slog.String("datacenter", targetDC),
+					slog.Int("count", startedJobs),
+				)
+			}
+		}
+
+		// Trigger job evaluations to redistribute allocations (including newly started jobs)
 		s.logger.Info("triggering job evaluations for activated datacenter",
 			slog.String("datacenter", targetDC),
 		)
@@ -704,14 +748,59 @@ func (s *datacenterService) ActivateRegion(ctx context.Context, targetRegion str
 		slog.Int("errors_count", len(result.Errors)),
 	)
 
-	// Trigger job evaluations for all datacenters in the activated region
+	// Start dead jobs and trigger evaluations for all datacenters in the activated region
 	if result.UnDrainedNodes > 0 {
+		// Start dead jobs BEFORE triggering evaluations so they are included in the eval
+		s.logger.Info("checking for dead jobs to restart in region",
+			slog.String("region", targetRegion),
+			slog.Int("datacenters", len(targetClusters)),
+		)
+		totalStartedJobs := 0
+		for _, clusterName := range targetClusters {
+			jobs, err := s.repo.ListJobs(ctx, clusterName)
+			if err != nil {
+				errMsg := fmt.Sprintf("failed to list jobs for %s: %v", clusterName, err)
+				result.Errors = append(result.Errors, errMsg)
+				s.logger.Warn("failed to list jobs",
+					slog.String("datacenter", clusterName),
+					slog.String("error", err.Error()),
+				)
+				continue
+			}
+
+			for _, job := range jobs {
+				if job.Status == "dead" {
+					s.logger.Info("starting dead job",
+						slog.String("datacenter", clusterName),
+						slog.String("job_id", job.ID),
+						slog.String("job_name", job.Name),
+					)
+					if err := s.repo.StartJob(ctx, clusterName, job.ID); err != nil {
+						errMsg := fmt.Sprintf("datacenter %s, job %s: %v", clusterName, job.ID, err)
+						result.Errors = append(result.Errors, errMsg)
+						s.logger.Warn("failed to start job",
+							slog.String("datacenter", clusterName),
+							slog.String("job_id", job.ID),
+							slog.String("error", err.Error()),
+						)
+					} else {
+						totalStartedJobs++
+					}
+				}
+			}
+		}
+		if totalStartedJobs > 0 {
+			s.logger.Info("dead jobs started successfully in region",
+				slog.String("region", targetRegion),
+				slog.Int("count", totalStartedJobs),
+			)
+		}
+
+		// Trigger evaluations for all clusters in the region (including newly started jobs)
 		s.logger.Info("triggering job evaluations for activated region",
 			slog.String("region", targetRegion),
 			slog.Int("datacenters", len(targetClusters)),
 		)
-
-		// Trigger evaluations for all clusters in the region in parallel
 		evalErrors := []string{}
 		for _, clusterName := range targetClusters {
 			if err := s.repo.TriggerJobEvaluations(ctx, clusterName); err != nil {
@@ -1173,54 +1262,37 @@ func (s *datacenterService) PerformStartupReconciliation(ctx context.Context) er
 		return nil
 	}
 
-	// Fresh heartbeat exists but I'm starting up
-	// This could mean another instance is running, or we restarted quickly
+	// Heartbeat from my DC exists - this is my old heartbeat from before restart
+	// Check actual node state to determine if I should be active or drained
 	age := activeInfo.HeartbeatAge()
-	if age < s.heartbeatCfg.StaleThreshold {
-		s.logger.Warn("fresh heartbeat exists but I'm starting up - checking node states",
+
+	// Check if nodes are drained (without modifying them)
+	allDrained, checkErr := s.checkNodesAreDrained(ctx)
+	if checkErr != nil {
+		return fmt.Errorf("failed to check node states: %w", checkErr)
+	}
+
+	if !allDrained {
+		// Nodes are active - this is my old heartbeat, I was active before restart
+		s.logger.Info("found my old heartbeat with active nodes, resuming as active",
 			"heartbeat_age", age)
+		s.amDrained = false
+		return nil
+	}
 
-		// Check if nodes are drained (without modifying them)
-		allDrained, checkErr := s.checkNodesAreDrained(ctx)
-		if checkErr != nil {
-			return fmt.Errorf("failed to check node states: %w", checkErr)
-		}
-
-		if !allDrained {
-			// Nodes are active with fresh heartbeat
-			// If heartbeat is VERY fresh (< update_interval/2), another instance might be running
-			// Otherwise, this is likely our old heartbeat from before restart
-			if age < s.heartbeatCfg.UpdateInterval/2 {
-				s.logger.Error("very fresh heartbeat with active nodes - another instance might be running!",
-					"heartbeat_age", age,
-					"update_interval", s.heartbeatCfg.UpdateInterval,
-					"action", "draining nodes for safety")
-				// Drain nodes for safety
-				drained, drainErr := s.drainMyNodes(ctx)
-				if drainErr != nil {
-					return fmt.Errorf("failed to drain nodes: %w", drainErr)
-				}
-				s.amDrained = drained
-				return fmt.Errorf("another instance might be running (very fresh heartbeat + active nodes)")
-			}
-
-			// Heartbeat is not super fresh - likely our old heartbeat from before restart
-			s.logger.Info("found our old heartbeat with active nodes, resuming as active",
-				"heartbeat_age", age)
-			s.amDrained = false
-			return nil
-		}
-
-		// Nodes are already drained - safe to continue but stay drained
-		s.logger.Info("fresh heartbeat but nodes already drained, staying drained for safety",
+	// Nodes are drained - check if heartbeat is stale
+	if age < s.heartbeatCfg.StaleThreshold {
+		// Fresh heartbeat but nodes are drained - someone drained us recently
+		s.logger.Info("fresh heartbeat but nodes are drained, staying drained",
 			"heartbeat_age", age)
 		s.amDrained = true
 		return nil
 	}
 
-	// Heartbeat is old enough - safe to continue as active
-	s.logger.Info("resuming as active datacenter")
-	s.amDrained = false
+	// Stale heartbeat and nodes drained - can resume as active if needed
+	s.logger.Info("stale heartbeat with drained nodes, staying drained for safety",
+		"heartbeat_age", age)
+	s.amDrained = true
 	return nil
 }
 
@@ -1373,9 +1445,11 @@ func (s *datacenterService) heartbeatLoop(ctx context.Context) {
 						// Stay drained, don't update heartbeat
 						continue
 					}
-					// Heartbeat is stale enough - safe to resume
-					s.logger.Info("heartbeat is stale, safe to resume as active")
-					s.amDrained = false
+					// NEVER auto-undrain - only explicit activation via API
+					s.logger.Warn("nodes are drained, staying drained (no auto-undrain)",
+						"heartbeat_age", heartbeatAge)
+					// Stay drained, don't update heartbeat
+					continue
 				}
 			}
 
@@ -1415,4 +1489,32 @@ func (s *datacenterService) heartbeatLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// GetStatus returns the current status of the dc-switcher service including heartbeat info
+func (s *datacenterService) GetStatus(ctx context.Context) (*model.ServiceStatus, error) {
+	status := &model.ServiceStatus{
+		MyDatacenter:      s.myDatacenter,
+		AmDrained:         s.amDrained,
+		HeartbeatInterval: s.heartbeatCfg.UpdateInterval.Milliseconds(),
+		StaleThreshold:    s.heartbeatCfg.StaleThreshold.Milliseconds(),
+	}
+
+	// Try to read active datacenter from etcd
+	activeInfo, err := s.etcdRepo.ReadActiveDatacenter(ctx)
+	if err != nil {
+		// etcd not connected or no active datacenter
+		status.EtcdConnected = false
+		return status, nil
+	}
+
+	// etcd connected successfully
+	status.EtcdConnected = true
+	status.ActiveDatacenter = activeInfo.Datacenter
+	status.LastHeartbeat = activeInfo.LastHeartbeat
+	status.ActivatedAt = activeInfo.ActivatedAt
+	status.ActivatedBy = activeInfo.ActivatedBy
+	status.HeartbeatAge = activeInfo.HeartbeatAge().Milliseconds()
+
+	return status, nil
 }
